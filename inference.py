@@ -6,7 +6,7 @@ from scipy.interpolate import interp1d
 import numpy as np
 import pyworld
 import torch
-from modules.audio2pose import get_pose_from_audio, audio2poseLSTM
+from modules.audio2pose import get_pose_from_audio, audio2poseLSTM, audio2poseLSTM_Live
 from skimage import io, img_as_float32
 import cv2
 from modules.generator import OcclusionAwareGenerator
@@ -255,11 +255,11 @@ class TalkingHeadGenerator():
     # init function
     def __init__(self):
         self.audio_sample_rate = 16000
-        self.buffered_audio = None
-        self.buffered_audio_feature = None
+        self.in_audio = None
 
         self.audio_packet = []
         self.audio_feature_packet = []
+        self.pose_packet = []
 
         self.img = None
         self.kp_gen_source = None
@@ -268,6 +268,8 @@ class TalkingHeadGenerator():
         self.kp_detector = None
         self.img_generator = None
         self.audio2kp = None
+
+        self.pose_x = {}
 
 
     def set_img(self, img_path, model_path):
@@ -278,6 +280,8 @@ class TalkingHeadGenerator():
         img = np.array(img_as_float32(img))
         img = img.transpose((2, 0, 1))
         self.img = torch.from_numpy(img).unsqueeze(0).cuda()
+
+        self.pose_x["img"] = self.img
 
         # set image generator
         config_file = r"./config/vox-256.yaml"
@@ -306,7 +310,7 @@ class TalkingHeadGenerator():
 
 
     def set_pose_generator(self, model_path):
-        self.pose_generator = audio2poseLSTM().cuda()
+        self.pose_generator = audio2poseLSTM_Live().cuda()
 
         ckpt_para = torch.load(model_path)
 
@@ -320,32 +324,56 @@ class TalkingHeadGenerator():
         mfcc_winlen_sample = int(self.audio_sample_rate * mfcc_winlen)
         mfcc_winstep_sample = int(self.audio_sample_rate * mfcc_winstep)
 
-        if self.buffered_audio is None:
-            self.buffered_audio = audio_clip
-        else:
-            self.buffered_audio = np.concatenate((self.buffered_audio, audio_clip), axis=0)
+        minv = np.array([-0.639, -0.501, -0.47, -102.6, -32.5, 184.6], dtype=np.float32)
+        maxv = np.array([0.411, 0.547, 0.433, 159.1, 116.5, 376.5], dtype=np.float32)
 
-        # if audio samples is not enough to extract a complete feature frame, return
-        # corner case, when audio samples is just enough to extract a complete feature frame, we still return to ease the following process
-        if self.buffered_audio.shape[0] <= mfcc_winlen_sample:
+
+        if self.in_audio is None:
+            self.in_audio = audio_clip
+        else:
+            self.in_audio = np.concatenate((self.in_audio, audio_clip), axis=0)
+
+        # at least 4 mfcc steps are needed to create a packet
+        if self.in_audio.shape[0] <= mfcc_winlen_sample + mfcc_winstep_sample * 4:
             return
 
         try:
             # extract audio feature        
-            audio_feature = self.get_audio_feature_from_audio(self.buffered_audio, self.audio_sample_rate)
+            audio_feature = self.get_audio_feature_from_audio(self.in_audio, self.audio_sample_rate)
 
-            # exclude the last feature, because it is not complete
-            audio_feature = audio_feature[:-1, :]
+            # every 4 mfcc steps are packed into a packet
+            audio_feature_len = audio_feature.shape[0]
+            packet_num = audio_feature_len // 4
 
-            # buffer remaining audio
-            featured_audio_len = audio_feature.shape[0] * mfcc_winstep_sample
-            self.buffered_audio = self.buffered_audio[featured_audio_len:]
+            # buffer each packet
+            audio_seq = []
+            for i in range(packet_num):
+                self.audio_packet.append(self.in_audio[i * mfcc_winstep_sample * 4: 
+                                                       (i + 1) * mfcc_winstep_sample * 4])
 
-            # record audio feature
-            if self.buffered_audio_feature is None:
-                self.buffered_audio_feature = audio_feature
-            else:
-                self.buffered_audio_feature = np.concatenate((self.buffered_audio_feature, audio_feature), axis=0)
+                feature_packet = audio_feature[i * 4: (i + 1) * 4, :]
+                self.audio_feature_packet.append(feature_packet)
+
+                audio_seq.append(feature_packet)
+
+            # calculate pose
+            audio = torch.from_numpy(np.array(audio_seq,dtype=np.float32)).unsqueeze(0).cuda()
+
+            self.pose_x["audio"] = audio
+            poses = self.pose_generator(self.pose_x)
+
+            poses = poses.cpu().data.numpy()[0]
+
+            poses = (poses+1)/2*(maxv-minv)+minv
+            rot, trans =  poses[:,:3].copy(), poses[:,3:].copy()
+
+            for i in range(packet_num):
+                self.pose_packet.append((rot[i], trans[i]))
+
+
+            # remove the used audio
+            featured_audio_len = packet_num * mfcc_winstep_sample * 4
+            self.in_audio = self.in_audio[featured_audio_len:]
 
         except:
             print("audio feature extraction error")
@@ -378,6 +406,7 @@ class TalkingHeadGenerator():
         audio_max = np.max(np.abs(audio))
         if audio_max > 0:
             audio = audio / audio_max
+
         a = python_speech_features.mfcc(audio, sample_rate)
         b = python_speech_features.logfbank(audio, sample_rate)
 
@@ -387,39 +416,9 @@ class TalkingHeadGenerator():
 
         frame_num = np.min([a.shape[0], b.shape[0], c.shape[0]])
         cat = np.concatenate([a[:frame_num], b[:frame_num], c[:frame_num], c_flag[:frame_num]], axis=1)
+
         return cat
 
-
-    def get_pose_from_audio_feature(self):
-        if self.buffered_audio_feature is None:
-            return None, None
-
-        num_frame = len(self.buffered_audio_feature) // 4
-        if num_frame < 1:
-            return None, None
-
-        minv = np.array([-0.639, -0.501, -0.47, -102.6, -32.5, 184.6], dtype=np.float32)
-        maxv = np.array([0.411, 0.547, 0.433, 159.1, 116.5, 376.5], dtype=np.float32)
-
-        audio_seq = []
-        for i in range(num_frame):
-            audio_seq.append(self.buffered_audio_feature[i*4:i*4+4])
-
-        # remove processed audio from audio_feature
-        self.buffered_audio_feature = self.buffered_audio_feature[num_frame*4:]
-
-        audio = torch.from_numpy(np.array(audio_seq,dtype=np.float32)).unsqueeze(0).cuda()
-
-        x = {}
-        x["img"] = self.img
-        x["audio"] = audio
-        poses = self.pose_generator(x)
-
-        poses = poses.cpu().data.numpy()[0]
-
-        poses = (poses+1)/2*(maxv-minv)+minv
-        rot, trans =  poses[:,:3].copy(),poses[:,3:].copy()
-        return rot, trans
 
 
 def main_old(parse):
@@ -437,12 +436,15 @@ if __name__ == '__main__':
 
     parse = parser.parse_args()
 
-    main_old(parse)
+    # main_old(parse)
 
     # read audio ./results/temp.wav using wavefile
     audio_path = parse.audio_path
 
     sample_rate, audio = wavfile.read(audio_path)
+
+    # clip audio
+    audio = audio[0:16000*10]
     
     # print sample rate and audio shape
     print("sample rate: ", sample_rate)
@@ -462,16 +464,29 @@ if __name__ == '__main__':
 
     # exit(0)
 
-    for i in range(0, len(audio), 320):
+    for i in range(0, len(audio), 160):
         # append audio
-        th_generator.append_audio(audio[i:i+320])
+        th_generator.append_audio(audio[i:i+160])
 
-        rot, trans = th_generator.get_pose_from_audio_feature()
+        # print info
+        print(i+160, 
+              th_generator.in_audio.shape,
+              len(th_generator.audio_packet),
+              len(th_generator.audio_feature_packet),
+              len(th_generator.pose_packet))
 
-        if rot is None or trans is None:
-            continue
+    # for each packet, generate image
+    for i in range(len(th_generator.audio_packet)):
+        rot = th_generator.pose_packet[i][0]
+        trans = th_generator.pose_packet[i][1]
 
-        th_generator.get_img(rot, trans)
+        pose_ano_img = np.zeros([256, 256])
+        draw_annotation_box(pose_ano_img, np.array(rot), np.array(trans))
+
+        # show pose_ano_img using opencv
+        cv2.imshow("pose_ano_img", pose_ano_img)
+        cv2.waitKey(1)
+
 
     exit(0)
 

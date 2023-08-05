@@ -29,6 +29,34 @@ class audio2poseLSTM(nn.Module):
         res = torch.cat(result,dim=1)
         return res
 
+
+class audio2poseLSTM_Live(audio2poseLSTM):
+    # init
+    def __init__(self):
+        super(audio2poseLSTM_Live, self).__init__()
+
+        self.img_em = None
+    
+    def forward(self,x):
+        if self.img_em is None:
+            self.img_em = self.em_img(x['img'])
+        img_em = self.img_em
+
+        result = []
+        bs,seqlen,_,_ = x["audio"].shape
+        zero_state = torch.zeros((2,bs,256),requires_grad=True).to(img_em.device)
+        cur_state = (zero_state,zero_state)
+        audio = x["audio"].reshape(-1, 1, 4, 41)
+        audio_em = self.em_audio(audio).reshape(bs, seqlen, 256)
+        for i in range(seqlen):
+
+            img_em,cur_state = self.lstm(torch.cat((audio_em[:,i:i+1],img_em.unsqueeze(1)),dim=2),cur_state)
+            img_em = img_em.reshape(-1, 256)
+            result.append(self.output(img_em).unsqueeze(1))
+        res = torch.cat(result,dim=1)
+        return res
+
+
 def get_pose_from_audio(img,audio,model_path):
     num_frame = len(audio) // 4
     minv = np.array([-0.639, -0.501, -0.47, -102.6, -32.5, 184.6], dtype=np.float32)
