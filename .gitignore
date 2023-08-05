@@ -1,0 +1,4 @@
+/modules/__pycache__
+/sync_batchnorm/__pycache__
+/checkpoints/audio2head.pth.tar
+/results
