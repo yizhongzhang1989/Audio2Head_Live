@@ -354,13 +354,7 @@ class TalkingHeadGenerator():
             # buffer each packet
             audio_seq = []
             for i in range(packet_num):
-                self.audio_packet.append(self.in_audio[i * mfcc_winstep_sample * 4: 
-                                                       (i + 1) * mfcc_winstep_sample * 4])
-
-                feature_packet = audio_feature[i * 4: (i + 1) * 4, :]
-                self.audio_feature_packet.append(feature_packet)
-
-                audio_seq.append(feature_packet)
+                audio_seq.append(audio_feature[i * 4: (i + 1) * 4, :])
 
             # calculate pose
             audio = torch.from_numpy(np.array(audio_seq,dtype=np.float32)).unsqueeze(0).cuda()
@@ -373,8 +367,15 @@ class TalkingHeadGenerator():
             poses = (poses+1)/2*(maxv-minv)+minv
             rot, trans =  poses[:,:3].copy(), poses[:,3:].copy()
 
-            for i in range(packet_num):
-                self.pose_packet.append((rot[i], trans[i]))
+
+            with self.packet_lock:
+                for i in range(packet_num):
+                    self.audio_packet.append(self.in_audio[i * mfcc_winstep_sample * 4: 
+                                                        (i + 1) * mfcc_winstep_sample * 4])
+
+                    self.audio_feature_packet.append(audio_feature[i * 4: (i + 1) * 4, :])
+
+                    self.pose_packet.append((rot[i], trans[i]))
 
 
             # remove the used audio
@@ -388,6 +389,10 @@ class TalkingHeadGenerator():
         # import matplotlib.pyplot as plt
         # plt.imshow(audio_feature.T, aspect='auto', origin='lower')
         # plt.show()
+
+
+    def get_av_packet(self):
+        pass
 
 
     def get_img(self, ref_pose_rot, ref_pose_trans):
@@ -426,7 +431,7 @@ class TalkingHeadGenerator():
         return cat
 
 
-    def synthesize_img_thread(self):
+    def generate_img_thread(self):
         pass
 
 
@@ -496,7 +501,7 @@ if __name__ == '__main__':
         th_generator.annotation_img_packet.append(pose_ano_img)        
 
     # for each gen_seq, generate image
-    for i in tqdm(range(0, len(th_generator.audio_packet), 32)):
+    for i in tqdm(range(0, len(th_generator.audio_packet), 32)):        
         if i+64 > len(th_generator.audio_packet):
             break
 
