@@ -13,7 +13,7 @@ from modules.generator import OcclusionAwareGenerator
 from modules.keypoint_detector import KPDetector
 from modules.audio2kp import AudioModel3D
 import yaml,os,imageio
-
+import threading
 
 
 def draw_annotation_box( image, rotation_vector, translation_vector, color=(255, 255, 255), line_width=2):
@@ -256,20 +256,26 @@ class TalkingHeadGenerator():
     def __init__(self):
         self.audio_sample_rate = 16000
         self.in_audio = None
+        self.generation_seq_len = 32    # should be even, max 64
 
+        # packets pushed in append_audio()
         self.audio_packet = []
         self.audio_feature_packet = []
         self.pose_packet = []
+        # packets pushed in synthesize_image_thread()
+        self.annotation_img_packet = []
+        self.portrait_img_packet = []
+        self.packet_lock = threading.Lock()
 
-        self.img = None
-        self.kp_gen_source = None
+        self.img = None                 # the source image
+        self.kp_gen_source = None       # the source image's keypoints
 
         self.pose_generator = None
         self.kp_detector = None
         self.img_generator = None
         self.audio2kp = None
 
-        self.pose_x = {}
+        self.pose_x = {}                # inference input for pose generator
 
 
     def set_img(self, img_path, model_path):
@@ -420,6 +426,9 @@ class TalkingHeadGenerator():
         return cat
 
 
+    def synthesize_img_thread(self):
+        pass
+
 
 def main_old(parse):
     os.makedirs(parse.save_path,exist_ok=True)
@@ -428,6 +437,8 @@ def main_old(parse):
 
 
 if __name__ == '__main__':
+    from tqdm import tqdm
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio_path",default=r"./demo/audio/intro.wav",help="audio file sampled as 16k hz")
     parser.add_argument("--img_path",default=r"./demo/img/paint.jpg", help="reference image")
@@ -444,7 +455,7 @@ if __name__ == '__main__':
     sample_rate, audio = wavfile.read(audio_path)
 
     # clip audio
-    audio = audio[0:16000*10]
+    # audio = audio[0:16000*10]
     
     # print sample rate and audio shape
     print("sample rate: ", sample_rate)
@@ -464,29 +475,78 @@ if __name__ == '__main__':
 
     # exit(0)
 
-    for i in range(0, len(audio), 160):
+    for i in tqdm(range(0, len(audio), 160)):
         # append audio
         th_generator.append_audio(audio[i:i+160])
-
-        # print info
-        print(i+160, 
-              th_generator.in_audio.shape,
-              len(th_generator.audio_packet),
-              len(th_generator.audio_feature_packet),
-              len(th_generator.pose_packet))
+        # # print info
+        # print(i+160, 
+        #       th_generator.in_audio.shape,
+        #       len(th_generator.audio_packet),
+        #       len(th_generator.audio_feature_packet),
+        #       len(th_generator.pose_packet))
 
     # for each packet, generate image
-    for i in range(len(th_generator.audio_packet)):
+    for i in tqdm(range(len(th_generator.audio_packet))):
         rot = th_generator.pose_packet[i][0]
         trans = th_generator.pose_packet[i][1]
 
         pose_ano_img = np.zeros([256, 256])
         draw_annotation_box(pose_ano_img, np.array(rot), np.array(trans))
 
-        # show pose_ano_img using opencv
-        cv2.imshow("pose_ano_img", pose_ano_img)
-        cv2.waitKey(1)
+        th_generator.annotation_img_packet.append(pose_ano_img)        
 
+    # for each gen_seq, generate image
+    for i in tqdm(range(0, len(th_generator.audio_packet), 32)):
+        if i+64 > len(th_generator.audio_packet):
+            break
+
+        audio_f = th_generator.audio_feature_packet[i:i+64]
+        poses = th_generator.annotation_img_packet[i:i+64]
+        audio_f = torch.from_numpy(np.array(audio_f,dtype=np.float32)).unsqueeze(0)
+        poses = torch.from_numpy(np.array(poses,dtype=np.float32)).unsqueeze(0)
+
+        t = {}
+        t["audio"] = audio_f.cuda()
+        t["pose"] = poses.cuda()
+        t["id_img"] = th_generator.img
+
+        gen_kp = th_generator.audio2kp(t)
+
+        if i == 0:
+            startid = 0
+            end_id = 48
+        else:
+            startid = 16
+            end_id = 48
+        for frame_bs_idx in range(startid, end_id):
+            tt = {}
+            tt["value"] = gen_kp["value"][:, frame_bs_idx]
+            tt["jacobian"] = gen_kp["jacobian"][:, frame_bs_idx]
+            out_gen = th_generator.img_generator(th_generator.img, 
+                                                 kp_source=th_generator.kp_gen_source, 
+                                                 kp_driving=tt)
+
+            out_img = (np.transpose(out_gen['prediction'].data.cpu().numpy(), [0, 2, 3, 1])[0] * 255).astype(np.uint8)
+            th_generator.portrait_img_packet.append(out_img)
+
+
+    # for i in range(len(th_generator.audio_packet)):
+    #     pose_ano_img = th_generator.annotation_img_packet[i]
+
+    #     # show pose_ano_img using opencv
+    #     cv2.imshow("pose_ano_img", pose_ano_img)
+    #     cv2.waitKey(1)
+
+
+    for i in range(len(th_generator.portrait_img_packet)):
+        out_img = th_generator.portrait_img_packet[i]
+
+        # convert out_img to BGR
+        out_img = cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR)
+        
+        # show out_img using opencv
+        cv2.imshow("out_img", out_img)
+        cv2.waitKey(1)
 
     exit(0)
 
