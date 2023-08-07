@@ -14,6 +14,7 @@ from modules.keypoint_detector import KPDetector
 from modules.audio2kp import AudioModel3D
 import yaml,os,imageio
 import threading
+import time
 
 
 def draw_annotation_box( image, rotation_vector, translation_vector, color=(255, 255, 255), line_width=2):
@@ -277,6 +278,9 @@ class TalkingHeadGenerator():
 
         self.pose_x = {}                # inference input for pose generator
 
+        self.generate_img_thread_running = False
+        self.generate_img_thread_termiante = False
+
 
     def set_img(self, img_path, model_path):
         # load image
@@ -292,7 +296,7 @@ class TalkingHeadGenerator():
         # set image generator
         config_file = r"./config/vox-256.yaml"
         with open(config_file) as f:
-            config = yaml.load(f)
+            config = yaml.load(f, Loader=yaml.FullLoader)
         self.kp_detector = KPDetector(**config['model_params']['kp_detector_params'],
                                       **config['model_params']['common_params'])
         self.img_generator = OcclusionAwareGenerator(**config['model_params']['generator_params'],
@@ -300,7 +304,7 @@ class TalkingHeadGenerator():
         self.kp_detector = self.kp_detector.cuda()
         self.img_generator = self.img_generator.cuda()
 
-        opt = argparse.Namespace(**yaml.load(open("./config/parameters.yaml")))
+        opt = argparse.Namespace(**yaml.load(open("./config/parameters.yaml"), Loader=yaml.FullLoader))
         self.audio2kp = AudioModel3D(opt).cuda()
 
         checkpoint  = torch.load(model_path)
@@ -322,6 +326,18 @@ class TalkingHeadGenerator():
 
         self.pose_generator.load_state_dict(ckpt_para["audio2pose"])
         self.pose_generator.eval()
+
+
+    def start_generate_img_thread(self):
+        self.generate_img_thread_running = True
+        self.generate_img_thread_termiante = False
+        self.func_generate_img_thread = threading.Thread(target=self.generate_img_thread)
+        self.func_generate_img_thread.start()
+
+    
+    def stop_generate_img_thread(self):
+        self.generate_img_thread_running = False
+        self.func_generate_img_thread.join()
 
 
     def append_audio(self, audio_clip):
@@ -392,7 +408,26 @@ class TalkingHeadGenerator():
 
 
     def get_av_packet(self):
-        pass
+        overlay_packet_num = int((64 - self.generation_seq_len) / 2)
+        process_packet_num = 64 - overlay_packet_num
+
+        # we need to keep at least overlay_packet_num in portriat_img_packet
+        with self.packet_lock:
+            if len(self.portrait_img_packet) < overlay_packet_num:
+                return None, None            
+            
+            # have enouth packets, return the head packet
+            audio_packet = self.audio_packet[0]            
+            portrait_img_packet = self.portrait_img_packet[0]
+
+            # remove the first packet
+            self.audio_packet = self.audio_packet[1:]
+            self.audio_feature_packet = self.audio_feature_packet[1:]
+            self.pose_packet = self.pose_packet[1:]
+            self.annotation_img_packet = self.annotation_img_packet[1:]
+            self.portrait_img_packet = self.portrait_img_packet[1:]
+
+        return audio_packet, portrait_img_packet
 
 
     def get_img(self, ref_pose_rot, ref_pose_trans):
@@ -432,12 +467,91 @@ class TalkingHeadGenerator():
 
 
     def generate_img_thread(self):
-        pass
+        overlay_packet_num = int((64 - self.generation_seq_len) / 2)
+        process_packet_num = 64 - overlay_packet_num
+        init_flag = True
+
+        while self.generate_img_thread_running:
+            data_valid = False
+
+            # check whether there are enough packets to generate
+            with self.packet_lock:                
+                audio_packet_num = len(self.audio_packet)
+                packet_extra_packet_num = audio_packet_num - len(self.portrait_img_packet)
+
+                # if enough packets, copy packets to local
+                if audio_packet_num >= 64 and packet_extra_packet_num >= process_packet_num:
+                    start_idx = len(self.portrait_img_packet) - overlay_packet_num
+                    if start_idx < 0:
+                        start_idx = 0
+
+                    audio_feature_packet = self.audio_feature_packet[start_idx: start_idx + 64]
+                    pose_packet = self.pose_packet[start_idx: start_idx + 64]
+                    annotation_img_packet = self.annotation_img_packet[start_idx: start_idx + 64]
+
+                    data_valid = True
+
+            # currently not enough packets, wait for a while
+            if not data_valid:
+                time.sleep(0.01)
+                continue
+
+            # generate annotation image if needed
+            old_annotation_img_packet_len = len(annotation_img_packet)
+            for i in range(old_annotation_img_packet_len, 64):
+                rot = pose_packet[i][0]
+                trans = pose_packet[i][1]
+                pose_ano_img = np.zeros([256, 256])
+                draw_annotation_box(pose_ano_img, np.array(rot), np.array(trans))
+                annotation_img_packet.append(pose_ano_img)
+
+            # calculate keypoints
+            audio_f = torch.from_numpy(np.array(audio_feature_packet,dtype=np.float32)).unsqueeze(0).cuda()
+            poses = torch.from_numpy(np.array(annotation_img_packet,dtype=np.float32)).unsqueeze(0).cuda()
+
+            t = {
+                "audio": audio_f,
+                "pose": poses,
+                "id_img": self.img
+            }
+            gen_kp = self.audio2kp(t)
+
+            # generate portrait image
+            if init_flag:
+                startid = 0
+                end_id = process_packet_num
+                init_flag = False
+            else:
+                startid = overlay_packet_num
+                end_id = process_packet_num
+
+            portrait_img_packet = []
+            for frame_bs_idx in range(startid, end_id):
+                tt = {}
+                tt["value"] = gen_kp["value"][:, frame_bs_idx]
+                tt["jacobian"] = gen_kp["jacobian"][:, frame_bs_idx]
+                out_gen = self.img_generator(self.img, 
+                                             kp_source=self.kp_gen_source, 
+                                             kp_driving=tt)
+
+                out_img = (np.transpose(out_gen['prediction'].data.cpu().numpy(), [0, 2, 3, 1])[0] * 255).astype(np.uint8)
+                portrait_img_packet.append(out_img)
+
+            with self.packet_lock:
+                self.annotation_img_packet.extend(annotation_img_packet[old_annotation_img_packet_len:])
+                self.portrait_img_packet.extend(portrait_img_packet)
+
+            # print('appended annotation_img_packet: ', 64 - old_annotation_img_packet_len)
+            # print('appended portrait_img_packet: ', len(portrait_img_packet))
+
+        self.generate_img_thread_termiante = True
 
 
 def main_old(parse):
     os.makedirs(parse.save_path,exist_ok=True)
     audio2head(parse.audio_path,parse.img_path,parse.model_path,parse.save_path)
+
+    
 
 
 
@@ -470,25 +584,67 @@ if __name__ == '__main__':
     th_generator = TalkingHeadGenerator()
     th_generator.set_img(parse.img_path, parse.model_path)
     th_generator.set_pose_generator(parse.model_path)
+    th_generator.start_generate_img_thread()
 
-    # for i in range(1, 1000):
-    #     clip = audio[0:i]
-    #     c = th_generator.get_audio_feature_from_audio(clip, sample_rate)
+    # create two threads, one for audio, one for video
 
-    #     # print i and c.shape
-    #     print(clip.shape, c.shape)
+    def audio_thread():
+        print("audio thread start")
+        for i in tqdm(range(0, len(audio), 160)):
+            th_generator.append_audio(audio[i:i+160])
+        print("audio thread end")
+        
+    def video_thread():    
+        print("video thread start")
+        # get current time
+        start_time = time.time()
 
-    # exit(0)
+        # while current time - start time < 30 seconds
+        audios = []
+        while time.time() - start_time < 30:
+            audio_packet, video_packet = th_generator.get_av_packet()
 
-    for i in tqdm(range(0, len(audio), 160)):
-        # append audio
-        th_generator.append_audio(audio[i:i+160])
-        # # print info
-        # print(i+160, 
-        #       th_generator.in_audio.shape,
-        #       len(th_generator.audio_packet),
-        #       len(th_generator.audio_feature_packet),
-        #       len(th_generator.pose_packet))
+            if audio_packet is None:
+                # sleep for a while
+                time.sleep(0.01)
+                continue
+
+            audios.append(audio_packet)
+
+            # show the video
+            out_img = cv2.cvtColor(video_packet, cv2.COLOR_RGB2BGR)
+            cv2.imshow("video", out_img)
+            cv2.waitKey(33)
+
+        # concatenate all audio packets and play
+        audio = np.concatenate(audios)
+        print(audio.shape)
+
+        import sounddevice as sd
+        duration = len(audio) / sample_rate
+        sd.play(audio, sample_rate)
+        sd.wait(duration)
+        
+
+        print("video thread end")
+
+    # start audio thread and video thread without blocking
+    th_audio = threading.Thread(target=audio_thread)
+    th_video = threading.Thread(target=video_thread)
+    th_audio.start()
+    th_video.start()
+
+    # wait for both threads to terminate
+    th_audio.join()
+    th_video.join()
+
+    # terminate generate_img_thread
+    th_generator.stop_generate_img_thread()
+
+
+    exit(0)
+        
+
 
     # for each packet, generate image
     for i in tqdm(range(len(th_generator.audio_packet))):
