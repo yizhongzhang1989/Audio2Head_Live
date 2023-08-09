@@ -2,3 +2,4 @@
 /sync_batchnorm/__pycache__
 /checkpoints/audio2head.pth.tar
 /results
+/__pycache__/*.pyc

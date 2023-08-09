@@ -15,6 +15,7 @@ from modules.audio2kp import AudioModel3D
 import yaml,os,imageio
 import threading
 import time
+from av_buffer_cp import AVBuffer, AVBufferPlayer
 
 
 def draw_annotation_box( image, rotation_vector, translation_vector, color=(255, 255, 255), line_width=2):
@@ -552,23 +553,7 @@ def main_old(parse):
     audio2head(parse.audio_path,parse.img_path,parse.model_path,parse.save_path)
 
     
-
-
-
-if __name__ == '__main__':
-    from tqdm import tqdm
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--audio_path",default=r"./demo/audio/intro.wav",help="audio file sampled as 16k hz")
-    parser.add_argument("--img_path",default=r"./demo/img/paint.jpg", help="reference image")
-    parser.add_argument("--save_path",default=r"./results", help="save path")
-    parser.add_argument("--model_path",default=r"./checkpoints/audio2head.pth.tar", help="pretrained model path")
-
-    parse = parser.parse_args()
-
-    # main_old(parse)
-
-    # read audio ./results/temp.wav using wavefile
+def concurrent_synthesis(parse):
     audio_path = parse.audio_path
 
     sample_rate, audio = wavfile.read(audio_path)
@@ -641,6 +626,81 @@ if __name__ == '__main__':
     # terminate generate_img_thread
     th_generator.stop_generate_img_thread()
 
+
+
+if __name__ == '__main__':
+    from tqdm import tqdm
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--audio_path",default=r"./demo/audio/intro.wav",help="audio file sampled as 16k hz")
+    parser.add_argument("--img_path",default=r"./demo/img/paint.jpg", help="reference image")
+    parser.add_argument("--save_path",default=r"./results", help="save path")
+    parser.add_argument("--model_path",default=r"./checkpoints/audio2head.pth.tar", help="pretrained model path")
+
+    parse = parser.parse_args()
+
+    # main_old(parse)
+
+    # read audio ./results/temp.wav using wavefile
+    audio_path = parse.audio_path
+
+    sample_rate, audio = wavfile.read(audio_path)
+
+    # clip audio
+    # audio = audio[0:16000*10]
+    
+    # print sample rate and audio shape
+    print("sample rate: ", sample_rate)
+    print("audio shape: ", audio.shape)
+
+    # create TalkingHeadGenerator
+    th_generator = TalkingHeadGenerator()
+    th_generator.set_img(parse.img_path, parse.model_path)
+    th_generator.set_pose_generator(parse.model_path)
+    th_generator.start_generate_img_thread()
+
+    av_buffer = AVBuffer()
+    av_buffer_player = AVBufferPlayer(av_buffer)
+
+    # create two threads, one for audio, one for video
+
+    def audio_thread():
+        print("audio thread start")
+        for i in tqdm(range(0, len(audio), 160)):
+            th_generator.append_audio(audio[i:i+160])
+        print("audio thread end")
+        
+    def video_thread():    
+        print("video thread start")
+        # get current time
+        start_time = time.time()
+
+        # while current time - start time < 30 seconds
+        audios = []
+        while time.time() - start_time < 30:
+            audio_packet, video_packet = th_generator.get_av_packet()
+
+            if audio_packet is None:
+                # sleep for a while
+                time.sleep(0.01)
+                continue
+
+            # video_rgb2bgr
+            video_packet = cv2.cvtColor(video_packet, cv2.COLOR_RGB2BGR)
+
+            av_buffer.add_audio(audio_packet)
+            av_buffer.add_video_frame(video_packet)
+
+    # start audio thread and video thread without blocking
+    th_audio = threading.Thread(target=audio_thread)
+    th_video = threading.Thread(target=video_thread)
+    th_audio.start()
+    th_video.start()
+
+    av_buffer_player.play()
+
+    # terminate generate_img_thread
+    th_generator.stop_generate_img_thread()
 
     exit(0)
         
