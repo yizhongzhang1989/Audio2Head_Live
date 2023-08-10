@@ -16,7 +16,7 @@ class AudioBuffer:
         self.audio_packet_buffer = []   # list of ndarrays
         self.audio_buffer_lock = multiprocessing.Lock()
         
-        self.audio_buffering_time = 1.0 # in seconds, negative means infinite buffering
+        self.audio_buffering_time = -1.0 # in seconds, negative means infinite buffering
 
 
     def add_audio(self, audio: np.ndarray):
@@ -91,7 +91,7 @@ class VideoBuffer:
         self.video_buffer = []
         self.video_buffer_lock = multiprocessing.Lock()
 
-        self.video_buffering_time = 1.0 # in seconds, negative means infinite buffering
+        self.video_buffering_time = -1.0 # in seconds, negative means infinite buffering
 
 
     def add_video_frame(self, video_frame: np.ndarray):
