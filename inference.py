@@ -1,21 +1,33 @@
 import argparse
+import threading
 import subprocess
-import python_speech_features
+import torch
+import cv2
+import time
+import pyworld
+import numpy as np
 from scipy.io import wavfile
 from scipy.interpolate import interp1d
-import numpy as np
-import pyworld
-import torch
-from modules.audio2pose import get_pose_from_audio, audio2poseLSTM, audio2poseLSTM_Live
-from skimage import io, img_as_float32
-import cv2
-from modules.generator import OcclusionAwareGenerator
-from modules.keypoint_detector import KPDetector
-from modules.audio2kp import AudioModel3D
 import yaml,os,imageio
-import threading
-import time
-from av_buffer_cp import AVBuffer, AVBufferPlayer
+import python_speech_features
+from skimage import io, img_as_float32
+from Audio2Head_Live.modules.audio2pose import get_pose_from_audio, audio2poseLSTM, audio2poseLSTM_Live
+from Audio2Head_Live.modules.generator import OcclusionAwareGenerator
+from Audio2Head_Live.modules.keypoint_detector import KPDetector
+from Audio2Head_Live.modules.audio2kp import AudioModel3D
+
+from Audio2Head_Live.av_buffer_cp import AVBuffer, AVBufferPlayer
+import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
+
+
+
+def get_abs_file_path(path):
+    # get path of this file
+    current_path = os.path.abspath(__file__)
+
+    return os.path.join(os.path.dirname(current_path), path)
+
 
 
 def draw_annotation_box( image, rotation_vector, translation_vector, color=(255, 255, 255), line_width=2):
@@ -143,7 +155,7 @@ def audio2head(audio_path, img_path, model_path, save_path):
     ref_pose_rot, ref_pose_trans = get_pose_from_audio(img, audio_feature, model_path)
     torch.cuda.empty_cache()
 
-    config_file = r"./config/vox-256.yaml"
+    config_file = get_abs_file_path(r"./config/vox-256.yaml")
     with open(config_file) as f:
         config = yaml.load(f)
     kp_detector = KPDetector(**config['model_params']['kp_detector_params'],
@@ -153,7 +165,7 @@ def audio2head(audio_path, img_path, model_path, save_path):
     kp_detector = kp_detector.cuda()
     generator = generator.cuda()
 
-    opt = argparse.Namespace(**yaml.load(open("./config/parameters.yaml")))
+    opt = argparse.Namespace(**yaml.load(open(get_abs_file_path("./config/parameters.yaml"))))
     audio2kp = AudioModel3D(opt).cuda()
 
     checkpoint  = torch.load(model_path)
@@ -295,7 +307,7 @@ class TalkingHeadGenerator():
         self.pose_x["img"] = self.img
 
         # set image generator
-        config_file = r"./config/vox-256.yaml"
+        config_file = get_abs_file_path(r"./config/vox-256.yaml")
         with open(config_file) as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
         self.kp_detector = KPDetector(**config['model_params']['kp_detector_params'],
@@ -305,7 +317,7 @@ class TalkingHeadGenerator():
         self.kp_detector = self.kp_detector.cuda()
         self.img_generator = self.img_generator.cuda()
 
-        opt = argparse.Namespace(**yaml.load(open("./config/parameters.yaml"), Loader=yaml.FullLoader))
+        opt = argparse.Namespace(**yaml.load(open(get_abs_file_path("./config/parameters.yaml")), Loader=yaml.FullLoader))
         self.audio2kp = AudioModel3D(opt).cuda()
 
         checkpoint  = torch.load(model_path)
@@ -631,11 +643,20 @@ def concurrent_synthesis(parse):
 if __name__ == '__main__':
     from tqdm import tqdm
 
+    # get absolute path of r"./demo/audio/intro.wav"
+    intro_wav_path = get_abs_file_path(r"./demo/audio/intro.wav")
+    # get absolute path of r"./demo/img/paint.jpg"
+    paint_img_path = get_abs_file_path(r"./demo/img/paint.jpg")
+    # get absolute path of r"./checkpoints/audio2head.pth.tar"
+    model_path = get_abs_file_path(r"./checkpoints/audio2head.pth.tar")
+    # get absolute path of r"./results"
+    save_path = get_abs_file_path(r"./results")
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--audio_path",default=r"./demo/audio/intro.wav",help="audio file sampled as 16k hz")
-    parser.add_argument("--img_path",default=r"./demo/img/paint.jpg", help="reference image")
-    parser.add_argument("--save_path",default=r"./results", help="save path")
-    parser.add_argument("--model_path",default=r"./checkpoints/audio2head.pth.tar", help="pretrained model path")
+    parser.add_argument("--audio_path",default=intro_wav_path,help="audio file sampled as 16k hz")
+    parser.add_argument("--img_path",default=paint_img_path, help="reference image")
+    parser.add_argument("--save_path",default=save_path, help="save path")
+    parser.add_argument("--model_path",default=model_path, help="pretrained model path")
 
     parse = parser.parse_args()
 

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from modules.util import MyResNet34
+from Audio2Head_Live.modules.util import MyResNet34
 import numpy as np
 
 class audio2poseLSTM(nn.Module):

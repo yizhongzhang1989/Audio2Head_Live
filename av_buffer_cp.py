@@ -5,7 +5,7 @@ import numpy as np
 import sounddevice as sd
 import cv2
 import time
-
+import math
 
 
 class AudioBuffer:
@@ -15,6 +15,8 @@ class AudioBuffer:
         self.audio_sample_idx = 0       # index of the first sample in packet buffer
         self.audio_packet_buffer = []   # list of ndarrays
         self.audio_buffer_lock = multiprocessing.Lock()
+        
+        self.audio_buffering_time = 1.0 # in seconds, negative means infinite buffering
 
 
     def add_audio(self, audio: np.ndarray):
@@ -44,6 +46,16 @@ class AudioBuffer:
         if len(packets) > 0:
             with self.audio_buffer_lock:
                 self.audio_packet_buffer.extend(packets)
+
+        # remove old packets if buffer is too long
+        if self.audio_buffering_time > 0.0:
+            # calculate the number of packets to be removed
+            max_buffer_size = math.ceil(self.audio_buffering_time * self.audio_sample_rate / self.audio_packet_size)
+            with self.audio_buffer_lock:
+                if len(self.audio_packet_buffer) > max_buffer_size:
+                    # remove old packets                
+                    self.audio_packet_buffer = self.audio_packet_buffer[-max_buffer_size:]
+                    self.audio_sample_idx += max_buffer_size * self.audio_packet_size
 
 
     def get_audio_packet(self, padding=True):
@@ -79,12 +91,22 @@ class VideoBuffer:
         self.video_buffer = []
         self.video_buffer_lock = multiprocessing.Lock()
 
+        self.video_buffering_time = 1.0 # in seconds, negative means infinite buffering
+
 
     def add_video_frame(self, video_frame: np.ndarray):
+        # calculate max number of frames to be buffered
+        max_buffer_size = math.ceil(self.video_buffering_time * self.video_frame_rate)
+
         with self.video_buffer_lock:
             if self.video_frame_shape != video_frame.shape:
                 # update video shape
                 self.video_frame_shape = video_frame.shape
+            
+            # remove old frames if buffer is too long
+            if self.video_buffering_time > 0.0 and len(self.video_buffer) >= max_buffer_size:
+                # set video_buffer length to max_buffer_size - 1
+                self.video_buffer = self.video_buffer[-max_buffer_size+1:]
 
             self.video_buffer.append(video_frame)
 
@@ -247,6 +269,7 @@ class AVBufferPlayer:
 
         self.next_video_frame = None
         self.next_video_frame_lock = threading.Lock()
+
 
     def play(self):
         with sd.OutputStream(channels=1, 

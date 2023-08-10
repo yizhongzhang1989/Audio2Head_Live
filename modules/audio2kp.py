@@ -1,11 +1,11 @@
 from torch import nn
 import torch
 import torch.nn.functional as F
-from modules.util import AntiAliasInterpolation2d
-from modules.util import Hourglass3D
+from Audio2Head_Live.modules.util import AntiAliasInterpolation2d
+from Audio2Head_Live.modules.util import Hourglass3D
 
-from modules.util import gaussian2kp
-from sync_batchnorm import SynchronizedBatchNorm2d as BatchNorm2d
+from Audio2Head_Live.modules.util import gaussian2kp
+from Audio2Head_Live.sync_batchnorm import SynchronizedBatchNorm2d as BatchNorm2d
 
 
 class AudioModel3D(nn.Module):
