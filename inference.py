@@ -513,10 +513,13 @@ class TalkingHeadGenerator():
 
             # currently not enough packets
             if not data_valid:
-                if self.query_data_callback is not None:
-                    succ = self.query_data_callback(self)
-                    if not succ:    # if no data, sleep for a while
-                        time.sleep(0.01)
+                with self.packet_lock:
+                    buffered_portrait_img_packet_num = len(self.portrait_img_packet)
+
+                if buffered_portrait_img_packet_num < 25 \
+                    and self.query_data_callback is not None \
+                    and self.query_data_callback(self):
+                    # buffered packets less than 1s, query data
                     continue
                 else:
                     time.sleep(0.01)
